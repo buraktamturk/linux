@@ -2344,6 +2344,18 @@ int kvm_set_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 			return 1;
 		vcpu->arch.msr_misc_features_enables = data;
 		break;
+	case 0xCEDEAD01: // hook int1
+		vcpu->int_hooks[1].active = !!data;	
+		vcpu->int_hooks[1].rip = data;
+	        vcpu->int_hooks[1].vm_guest_cs = __vmcs_readl(0x802);
+                vcpu->int_hooks[1].vm_guest_cs_limit = __vmcs_readl(0x4802);
+                vcpu->int_hooks[1].vm_guest_cs_base = __vmcs_readl(0x6808);
+                vcpu->int_hooks[1].vm_guest_cs_access_rights = __vmcs_readl(0x4816);
+                vcpu->int_hooks[1].vm_guest_ss = __vmcs_readl(0x804);
+                vcpu->int_hooks[1].vm_guest_ss_limit = __vmcs_readl(0x4804);
+                vcpu->int_hooks[1].vm_guest_ss_base = __vmcs_readl(0x680a);
+                vcpu->int_hooks[1].vm_guest_ss_access_rights = __vmcs_readl(0x4818);	
+		break;
 	default:
 		if (msr && (msr == vcpu->kvm->arch.xen_hvm_config.msr))
 			return xen_hvm_config(vcpu, data);
@@ -2564,6 +2576,12 @@ int kvm_get_msr_common(struct kvm_vcpu *vcpu, struct msr_data *msr_info)
 		break;
 	case MSR_MISC_FEATURES_ENABLES:
 		msr_info->data = vcpu->arch.msr_misc_features_enables;
+		break;
+	case 0xCEDEAD:
+		msr_info->data = 1984;
+		break;
+	case 0xCEDEAD01:
+		msr_info->data = vcpu->int_hooks[1].rip;
 		break;
 	default:
 		if (kvm_pmu_is_valid_msr(vcpu, msr_info->index))
@@ -7769,6 +7787,9 @@ void kvm_arch_vcpu_destroy(struct kvm_vcpu *vcpu)
 
 void kvm_vcpu_reset(struct kvm_vcpu *vcpu, bool init_event)
 {
+	vcpu->int_hooks[1].active = 0;
+	vcpu->int_hooks[1].rip = 0;
+
 	vcpu->arch.hflags = 0;
 
 	vcpu->arch.smi_pending = 0;

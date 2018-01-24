@@ -214,6 +214,21 @@ struct kvm_mmio_fragment {
 	unsigned len;
 };
 
+#define MAX_INT_HOOK 32
+
+struct int_hook {
+	int active;
+	u64 vm_guest_cs;
+	u64 vm_guest_cs_limit;
+	u64 vm_guest_cs_base;
+	u64 vm_guest_cs_access_rights;
+	u64 vm_guest_ss;
+	u64 vm_guest_ss_limit;
+	u64 vm_guest_ss_base;
+	u64 vm_guest_ss_access_rights;
+	gva_t rip;
+};
+
 struct kvm_vcpu {
 	struct kvm *kvm;
 #ifdef CONFIG_PREEMPT_NOTIFIERS
@@ -274,6 +289,7 @@ struct kvm_vcpu {
 	bool preempted;
 	struct kvm_vcpu_arch arch;
 	struct dentry *debugfs_dentry;
+	struct int_hook int_hooks[MAX_INT_HOOK];
 };
 
 static inline int kvm_vcpu_exiting_guest_mode(struct kvm_vcpu *vcpu)

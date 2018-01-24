@@ -294,6 +294,12 @@ int kvm_vcpu_init(struct kvm_vcpu *vcpu, struct kvm *kvm, unsigned id)
 	r = kvm_arch_vcpu_init(vcpu);
 	if (r < 0)
 		goto fail_free_run;
+
+	int i;
+	for(i = 0; i < 32; ++i) {
+		vcpu->int_hooks[i].active = 0;
+	}
+
 	return 0;
 
 fail_free_run:
