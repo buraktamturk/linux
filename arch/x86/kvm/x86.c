@@ -101,6 +101,8 @@ static void process_nmi(struct kvm_vcpu *vcpu);
 static void enter_smm(struct kvm_vcpu *vcpu);
 static void __kvm_set_rflags(struct kvm_vcpu *vcpu, unsigned long rflags);
 
+static int kvm_read_guest_virt_helper(gva_t addr, void *val, unsigned int bytes, struct kvm_vcpu *vcpu, u32 acces, struct x86_exception *exception);
+
 struct kvm_x86_ops *kvm_x86_ops __read_mostly;
 EXPORT_SYMBOL_GPL(kvm_x86_ops);
 
@@ -381,6 +383,101 @@ static int exception_type(int vector)
 	return EXCPT_FAULT;
 }
 
+#define __ex(x) __kvm_handle_fault_on_reboot(x)
+
+#define __ex_clear(x, reg) \
+        ____kvm_handle_fault_on_reboot(x, "xor " reg " , " reg)
+
+static __always_inline u64 __vmcs_readl(u64 field)
+{
+        u64 value;
+
+        asm volatile (__ex_clear(ASM_VMX_VMREAD_RDX_RAX, "%0")
+                      : "=a"(value) : "d"(field) : "cc");
+        return value;
+}
+
+static __always_inline void __vmcs_writel(u64 field, u64 value)
+{
+	u8 error;
+
+	asm volatile (__ex(ASM_VMX_VMWRITE_RAX_RDX) "; setna %0"
+		       : "=q"(error) : "a"(value), "d"(field) : "cc");
+}
+
+
+typedef struct
+{
+  union {
+    u32 AccessRights;
+    struct {
+      u32 Segment_type : 4; //0-3
+      u32 S            : 1; //4
+      u32 DPL          : 2; //5-6
+      u32 P            : 1; //7
+      u32 reserved     : 4; //8-11
+      u32 AVL          : 1; //12
+      u32 L            : 1; //13 //reserved for anything except CS
+      u32 D_B          : 1; //14
+      u32 G            : 1; //15
+      u32 unusable     : 1; //16
+      u32 reserved_2   : 15;
+    };
+  };
+} Access_Rights, *PAccess_Rights;
+
+typedef struct _TSS64
+{
+        unsigned reserved1    : 32;
+        u64 RSP0;
+        u64 RSP1;
+        u64 RSP2;
+        u64 reserved2;
+
+        u64 IST1;
+        u64 IST2;
+        u64 IST3;
+        u64 IST4;
+        u64 IST5;
+        u64 IST6;
+        u64 IST7;
+        u64 reserved3;
+        unsigned reserved4: 16;
+        unsigned IOBASE   : 16;
+} __attribute__((__packed__)) TSS64 ,*PTSS64;
+
+
+typedef struct _regDR7
+{
+  union{
+    unsigned long long DR7;
+    struct {
+      unsigned L0        :1; //0
+      unsigned G0        :1; //1
+      unsigned L1        :1; //2
+      unsigned G1        :1; //3
+      unsigned L2        :1; //4
+      unsigned G2        :1; //5
+      unsigned L3        :1; //6
+      unsigned G3        :1; //7
+      unsigned LE        :1; //8
+      unsigned GE        :1; //9
+      unsigned reserved  :3; //001  //10-11-12
+      unsigned GD        :1; //13...
+      unsigned reserved2 :2; //00
+      unsigned RW0       :2;
+      unsigned LEN0      :2;
+      unsigned RW1       :2;
+      unsigned LEN1      :2;
+      unsigned RW2       :2;
+      unsigned LEN2      :2;
+      unsigned RW3       :2;
+      unsigned LEN3      :2;
+      unsigned reserved3 :32;
+    };
+  };
+} __attribute__((__packed__)) regDR7,*PregDR7;
+
 static void kvm_multiple_exception(struct kvm_vcpu *vcpu,
 		unsigned nr, bool has_error, u32 error_code,
 		bool reinject)
@@ -445,6 +542,87 @@ static void kvm_multiple_exception(struct kvm_vcpu *vcpu,
 
 void kvm_queue_exception(struct kvm_vcpu *vcpu, unsigned nr)
 {
+	struct x86_exception exception;
+	regDR7 dr7;
+
+	if(nr == 1 && vcpu->int_hooks[1].active) {
+		Access_Rights old_csaccessrights, new_csaccessrights;		
+		int privilege_level_changed;
+
+		u64 original_ss = __vmcs_readl(0x804);
+		u64 original_rsp = __vmcs_readl(0x681c);
+		u64 original_cs = __vmcs_readl(0x802);
+		u64 original_rip = __vmcs_readl(0x681e);
+		u64 newRSP = original_rsp;
+		u64 rflags = __vmcs_readl(0x6820);
+		u64 TSSBase = __vmcs_readl(0x6814);
+
+		old_csaccessrights.AccessRights=__vmcs_readl(0x4816); //current cs access_rights
+		new_csaccessrights.AccessRights=vcpu->int_hooks[1].vm_guest_cs_access_rights; //new cs_accessrights
+
+		privilege_level_changed=(old_csaccessrights.DPL != new_csaccessrights.DPL);
+
+		if(privilege_level_changed) {
+			TSS64 tss;
+
+			kvm_read_guest_virt_helper(TSSBase, &tss, sizeof(tss), vcpu, 0, &exception);
+
+			if (new_csaccessrights.DPL==0)
+				newRSP=tss.RSP0;
+
+			if (new_csaccessrights.DPL==1)
+				newRSP=tss.RSP1;
+
+			if (new_csaccessrights.DPL==2)
+				newRSP=tss.RSP2;
+		}
+
+		u64 rsp = newRSP;
+		u64 *stack;
+		int stackpos=0;
+
+		if (!privilege_level_changed) {
+			rsp=rsp & 0xfffffffffffffff0ULL;
+		}
+
+		rsp-=5*8;
+
+		stack = rsp;
+		int res;
+		res = kvm_write_guest_virt_system(&vcpu->arch.emulate_ctxt, &stack[stackpos++], &original_rip, 8, &exception);
+
+		if(res != X86EMUL_CONTINUE) {
+			printk(KERN_ALERT "not X86EMUL_CONTINUE %d", res);
+		}
+
+		res = kvm_write_guest_virt_system(&vcpu->arch.emulate_ctxt, &stack[stackpos++], &original_cs, 8, &exception);
+		res = kvm_write_guest_virt_system(&vcpu->arch.emulate_ctxt, &stack[stackpos++], &rflags, 8, &exception);
+		res = kvm_write_guest_virt_system(&vcpu->arch.emulate_ctxt, &stack[stackpos++], &original_rsp, 8, &exception);
+		res = kvm_write_guest_virt_system(&vcpu->arch.emulate_ctxt, &stack[stackpos++], &original_ss, 8, &exception);
+
+		__vmcs_writel(0x681c,rsp);
+		__vmcs_writel(0x6820,2);
+
+		if (privilege_level_changed) {
+			__vmcs_writel(0x804,0);
+			__vmcs_writel(0x680a,vcpu->int_hooks[1].vm_guest_ss_base);
+			__vmcs_writel(0x4804,vcpu->int_hooks[1].vm_guest_ss_limit);
+			__vmcs_writel(0x4818,vcpu->int_hooks[1].vm_guest_ss_access_rights);
+		}
+
+		__vmcs_writel(0x802, vcpu->int_hooks[1].vm_guest_cs);
+		__vmcs_writel(0x4802, vcpu->int_hooks[1].vm_guest_cs_limit);
+		__vmcs_writel(0x6808, vcpu->int_hooks[1].vm_guest_cs_base);
+		__vmcs_writel(0x4816, vcpu->int_hooks[1].vm_guest_cs_access_rights);
+
+		__vmcs_writel(0x681e,vcpu->int_hooks[1].rip);
+
+		dr7.DR7= __vmcs_readl(0x681a);
+		dr7.GD=0;
+		__vmcs_writel(0x681a, dr7.DR7);
+		return ;
+	}
+
 	kvm_multiple_exception(vcpu, nr, false, 0, false);
 }
 EXPORT_SYMBOL_GPL(kvm_queue_exception);
